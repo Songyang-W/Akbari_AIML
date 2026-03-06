@@ -21,11 +21,13 @@ Pipeline:
 # IMPORTS
 # ==============================================================
 import os
+import sys
 import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from scipy import stats
 
 #%% ============================================================
 # CONFIGURATION
@@ -380,7 +382,18 @@ print("\n" + "=" * 60)
 print("BLOCK 4c: Nested-CV model comparison")
 print("=" * 60)
 
-from ml_pipeline import run_nested_cv, summarize_results, plot_comparison  # noqa: E402
+# Ensure the script directory is on sys.path so that ml_pipeline.py
+# can be imported reliably when running cells in Spyder/IPython.
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from ml_pipeline import (  # noqa: E402
+    run_repeated_nested_cv,
+    print_repeated_cv_summary,
+    plot_comparison,
+)
+
+feature_names = X.columns.tolist()
 
 for target_name, y_target in [("4hr NDS", y_4hr), ("24hr NDS", y_24hr)]:
     n_pos = int(y_target.sum())
@@ -391,6 +404,113 @@ for target_name, y_target in [("4hr NDS", y_4hr), ("24hr NDS", y_24hr)]:
         print(f"  SKIPPED — need ≥2 samples per class (got {n_pos}/{n_neg})")
         continue
 
-    results = run_nested_cv(X.values, y_target)
-    summarize_results(results, target_name=target_name)
-    plot_comparison(results, target_name=target_name)
+    repeated = run_repeated_nested_cv(
+        X,
+        y_target,
+        seeds=(11, 22, 33, 44, 55),
+        outer_k=5,
+        inner_k=5,
+        corr_threshold=0.85,
+        feature_names=feature_names,
+        verbose=False,
+    )
+    print_repeated_cv_summary(repeated, target_name=target_name, min_freq=0.80)
+
+    # Plot uses same scores structure
+    plot_scores = {name: {"scores": repeated["raw_scores"][name]} for name in repeated["raw_scores"]}
+    plot_comparison(plot_scores, target_name=target_name)
+
+#%% ============================================================
+# BLOCK 5 — CORRELATION: 4hr NDS vs MAP at MinSBP and SBP5minpostROSC
+# ==============================================================
+print("\n" + "=" * 60)
+print("BLOCK 5: Correlation of 4hr NDS with MAP at MinSBP and SBP5minpostROSC")
+print("=" * 60)
+
+# Build merged table: 4hr NDS (from df_subset) + raw BP cols from original sheet
+df_raw = dfs["No_REBOA_selected_column"]
+if "Rat ID" in df_subset.columns and "Rat ID" in df_raw.columns:
+    df_corr = df_subset[["Rat ID"]].copy()
+    df_corr["Rat ID"] = df_corr["Rat ID"].astype(str)
+    df_corr["4hr_NDS"] = max_4hr_nds.values
+    bp_cols = [c for c in ["MAP at the time of MinSBP", "SBP5minpostROSC"] if c in df_raw.columns]
+    if bp_cols:
+        df_raw_str = df_raw[["Rat ID"] + bp_cols].copy()
+        df_raw_str["Rat ID"] = df_raw_str["Rat ID"].astype(str)
+        for c in bp_cols:
+            df_raw_str[c] = pd.to_numeric(df_raw_str[c], errors="coerce")
+        df_corr = df_corr.merge(df_raw_str, on="Rat ID", how="left")
+    else:
+        for c in ["MAP at the time of MinSBP", "SBP5minpostROSC"]:
+            df_corr[c] = np.nan
+else:
+    df_corr = pd.DataFrame({
+        "4hr_NDS": max_4hr_nds.values,
+        "MAP at the time of MinSBP": np.nan,
+        "SBP5minpostROSC": np.nan,
+    })
+
+df_corr["4hr_NDS"] = pd.to_numeric(df_corr["4hr_NDS"], errors="coerce")
+
+def plot_correlation_with_stats(ax, x, y, xlabel, ylabel, title):
+    """Scatter plot with regression line, r and p in title or annotation."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    x_ = np.asarray(x, dtype=float)[mask]
+    y_ = np.asarray(y, dtype=float)[mask]
+    if len(x_) < 3:
+        ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    r, p = stats.pearsonr(x_, y_)
+    ax.scatter(x_, y_, alpha=0.7, edgecolors="k", linewidths=0.5)
+    # Regression line
+    slope, intercept, _, _, _ = stats.linregress(x_, y_)
+    x_line = np.linspace(x_.min(), x_.max(), 100)
+    ax.plot(x_line, slope * x_line + intercept, "r-", lw=2, label=f"r = {r:.3f}, p = {p:.4f}")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{title}\nr = {r:.3f}, p = {p:.4f}")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+if "MAP at the time of MinSBP" in df_corr.columns:
+    plot_correlation_with_stats(
+        axes[0],
+        df_corr["4hr_NDS"],
+        df_corr["MAP at the time of MinSBP"],
+        "4hr NDS",
+        "MAP at the time of MinSBP",
+        "4hr NDS vs MAP at the time of MinSBP",
+    )
+else:
+    axes[0].text(0.5, 0.5, "Column not found", ha="center", va="center", transform=axes[0].transAxes)
+
+if "SBP5minpostROSC" in df_corr.columns:
+    plot_correlation_with_stats(
+        axes[1],
+        df_corr["4hr_NDS"],
+        df_corr["SBP5minpostROSC"],
+        "4hr NDS",
+        "SBP5minpostROSC",
+        "4hr NDS vs SBP5minpostROSC",
+    )
+else:
+    axes[1].text(0.5, 0.5, "Column not found", ha="center", va="center", transform=axes[1].transAxes)
+
+plt.tight_layout()
+plt.show()
+
+# Print r and p for each
+for col, label in [("MAP at the time of MinSBP", "MAP at the time of MinSBP"), ("SBP5minpostROSC", "SBP5minpostROSC")]:
+    if col not in df_corr.columns:
+        continue
+    x = pd.to_numeric(df_corr["4hr_NDS"], errors="coerce")
+    y = pd.to_numeric(df_corr[col], errors="coerce")
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() >= 3:
+        r, p = stats.pearsonr(x[mask], y[mask])
+        print(f"  4hr NDS vs {label}:  r = {r:.4f},  p = {p:.4f}  (n = {mask.sum()})")
+    else:
+        print(f"  4hr NDS vs {label}:  insufficient pairs (n = {mask.sum()})")

@@ -11,11 +11,18 @@ Models compared:
 
 Usage
 -----
-    from ml_pipeline import run_nested_cv, summarize_results, plot_comparison
-
-    results = run_nested_cv(X, y)
+    # Single run (verbose)
+    from ml_pipeline import run_nested_cv, summarize_results, plot_comparison, report_feature_selection
+    results = run_nested_cv(X, y, feature_names=X.columns.tolist(), return_feature_selection=True)
     summarize_results(results, target_name="4hr NDS")
+    report_feature_selection(results)
     plot_comparison(results, target_name="4hr NDS")
+
+    # Repeated over seeds (compact output)
+    from ml_pipeline import run_repeated_nested_cv, print_repeated_cv_summary, plot_comparison
+    out = run_repeated_nested_cv(X, y, seeds=(11,22,33,44,55), verbose=False)
+    print_repeated_cv_summary(out, target_name="4hr NDS", min_freq=0.80)
+    plot_comparison({m: {"scores": out["raw_scores"][m]} for m in out["raw_scores"]}, target_name="4hr NDS")
 """
 
 import warnings
@@ -142,12 +149,41 @@ def _build_model_configs(corr_threshold, random_state):
 # ------------------------------------------------------------------ #
 #  Nested cross-validation                                            #
 # ------------------------------------------------------------------ #
+def _extract_feature_selection(pipeline, feature_names):
+    """From a fitted pipeline, return dropped/selected feature names."""
+    pruner = pipeline.named_steps["pruner"]
+    selector = pipeline.named_steps["selector"]
+
+    # After correlation pruning
+    kept_after_prune = [feature_names[i] for i in range(len(feature_names))
+                        if pruner.keep_mask_[i]]
+    dropped_by_corr = [feature_names[i] for i in range(len(feature_names))
+                       if not pruner.keep_mask_[i]]
+
+    # After embedded selection (selector operates on pruned features)
+    sel_support = selector.get_support()
+    selected = [kept_after_prune[i] for i in range(len(kept_after_prune))
+                if sel_support[i]]
+    dropped_by_sel = [kept_after_prune[i] for i in range(len(kept_after_prune))
+                      if not sel_support[i]]
+
+    return {
+        "dropped_by_correlation": dropped_by_corr,
+        "dropped_by_selector": dropped_by_sel,
+        "selected": selected,
+        "n_selected": len(selected),
+    }
+
+
 def run_nested_cv(
     X, y, *,
     corr_threshold=0.85,
     outer_k=5,
     inner_k=5,
     random_state=42,
+    feature_names=None,
+    return_feature_selection=False,
+    verbose=True,
 ):
     """Nested stratified CV comparing three classifiers.
 
@@ -156,17 +192,32 @@ def run_nested_cv(
 
     Parameters
     ----------
-    X : array-like  (n_samples, n_features)
+    X : array-like or DataFrame  (n_samples, n_features)
     y : array-like  (n_samples,)  binary 0/1
     corr_threshold : float   |r| cutoff for CorrelationPruner
     outer_k, inner_k : int   number of CV folds
     random_state : int
+    feature_names : list, optional   names for each column (inferred from X if DataFrame)
+    return_feature_selection : bool   if True, store per-fold dropped/selected features
+    verbose : bool   if True, print per-fold and per-model lines
 
     Returns
     -------
-    results : dict  ``{model_name: {"scores", "mean", "std", "best_params"}}``
+    results : dict  ``{model_name: {"scores", "mean", "std", "best_params",
+                  "feature_selection": [...]}}``  (feature_selection if requested)
     """
-    X_arr = np.asarray(X, dtype=float)
+    if hasattr(X, "columns"):
+        X_arr = np.asarray(X, dtype=float)
+        fnames = feature_names if feature_names is not None else X.columns.tolist()
+    else:
+        X_arr = np.asarray(X, dtype=float)
+        fnames = feature_names
+
+    if return_feature_selection and fnames is None:
+        return_feature_selection = False
+        if verbose:
+            print("  [WARNING] feature_names not provided — skipping feature selection tracking")
+
     y_arr = np.asarray(y, dtype=int)
 
     if len(np.unique(y_arr)) < 2:
@@ -176,8 +227,9 @@ def run_nested_cv(
     if min_class < outer_k:
         outer_k = max(2, min_class)
         inner_k = max(2, min_class - 1)
-        print(f"  [WARNING] Minority class has {min_class} samples "
-              f"— reducing to outer_k={outer_k}, inner_k={inner_k}")
+        if verbose:
+            print(f"  [WARNING] Minority class has {min_class} samples "
+                  f"— reducing to outer_k={outer_k}, inner_k={inner_k}")
 
     outer_cv = StratifiedKFold(
         n_splits=outer_k, shuffle=True, random_state=random_state,
@@ -190,8 +242,10 @@ def run_nested_cv(
     results = {}
 
     for name, cfg in configs.items():
-        print(f"\n  [{name}]  {outer_k}-fold outer × {inner_k}-fold inner")
+        if verbose:
+            print(f"\n  [{name}]  {outer_k}-fold outer × {inner_k}-fold inner")
         fold_scores, fold_params = [], []
+        fold_feat_sel = [] if return_feature_selection else None
 
         for fold_i, (tr_idx, te_idx) in enumerate(
             outer_cv.split(X_arr, y_arr)
@@ -217,7 +271,13 @@ def run_nested_cv(
             auc = roc_auc_score(y_te, y_proba)
             fold_scores.append(auc)
             fold_params.append(grid.best_params_)
-            print(f"    Fold {fold_i + 1}: AUC = {auc:.4f}")
+            if verbose:
+                print(f"    Fold {fold_i + 1}: AUC = {auc:.4f}")
+
+            if return_feature_selection:
+                fs = _extract_feature_selection(grid.best_estimator_, fnames)
+                fs["fold"] = fold_i + 1
+                fold_feat_sel.append(fs)
 
         results[name] = {
             "scores": fold_scores,
@@ -225,10 +285,176 @@ def run_nested_cv(
             "std":    float(np.std(fold_scores)),
             "best_params": fold_params,
         }
-        print(f"  [{name}]  >>>  AUC = {results[name]['mean']:.4f} "
-              f"± {results[name]['std']:.4f}")
+        if fold_feat_sel is not None:
+            results[name]["feature_selection"] = fold_feat_sel
+        if verbose:
+            print(f"  [{name}]  >>>  AUC = {results[name]['mean']:.4f} "
+                  f"± {results[name]['std']:.4f}")
 
     return results
+
+
+def run_repeated_nested_cv(
+    X, y, *,
+    seeds=(11, 22, 33, 44, 55),
+    outer_k=5,
+    inner_k=5,
+    corr_threshold=0.85,
+    feature_names=None,
+    verbose=False,
+):
+    """Repeated nested CV over multiple seeds; aggregate AUCs and feature frequencies.
+
+    Parameters
+    ----------
+    X : array-like or DataFrame
+    y : array-like  binary 0/1
+    seeds : sequence of int   random seeds for outer/inner CV
+    outer_k, inner_k : int
+    corr_threshold : float
+    feature_names : list, optional   inferred from X if DataFrame
+    verbose : bool   if True, print per-fold details from each run_nested_cv
+    min_freq : float   only print features with frequency >= this (default 0.80)
+
+    Returns
+    -------
+    dict with keys:
+      raw_scores : {model_name: list of all outer-fold AUCs}
+      seedwise_means : {model_name: list of mean AUC per seed}
+      feature_frequencies : {model_name: {"selected": {feat: count}, "corr_dropped": {...}, "selector_dropped": {...}}}
+      n_folds : int   total outer folds (len(seeds) * outer_k)
+      summary_table : list of dicts [{"model", "n", "mean", "std", "median", "min", "max"}, ...] sorted by mean desc
+    """
+    if hasattr(X, "columns"):
+        fnames = feature_names if feature_names is not None else X.columns.tolist()
+    else:
+        fnames = feature_names
+
+    all_scores = {}
+    seedwise_means = {}
+    feature_frequencies = {}
+    n_folds_total = 0
+
+    for seed in seeds:
+        res = run_nested_cv(
+            X, y,
+            corr_threshold=corr_threshold,
+            outer_k=outer_k,
+            inner_k=inner_k,
+            random_state=seed,
+            feature_names=fnames,
+            return_feature_selection=True,
+            verbose=verbose,
+        )
+        for name, r in res.items():
+            all_scores.setdefault(name, []).extend(r["scores"])
+            seedwise_means.setdefault(name, []).append(r["mean"])
+            if "feature_selection" not in r:
+                continue
+            ff = feature_frequencies.setdefault(name, {
+                "selected": {}, "corr_dropped": {}, "selector_dropped": {},
+            })
+            for fs in r["feature_selection"]:
+                for feat in fs["selected"]:
+                    ff["selected"][feat] = ff["selected"].get(feat, 0) + 1
+                for feat in fs["dropped_by_correlation"]:
+                    ff["corr_dropped"][feat] = ff["corr_dropped"].get(feat, 0) + 1
+                for feat in fs["dropped_by_selector"]:
+                    ff["selector_dropped"][feat] = ff["selector_dropped"].get(feat, 0) + 1
+
+    n_folds_total = len(all_scores[list(all_scores.keys())[0]]) if all_scores else 0
+
+    # summary_table: sort by mean AUC descending
+    summary_table = []
+    for name, scores in all_scores.items():
+        scores_arr = np.array(scores)
+        summary_table.append({
+            "model": name,
+            "n": len(scores),
+            "mean": float(np.mean(scores_arr)),
+            "std": float(np.std(scores_arr)),
+            "median": float(np.median(scores_arr)),
+            "min": float(np.min(scores_arr)),
+            "max": float(np.max(scores_arr)),
+        })
+    summary_table.sort(key=lambda r: r["mean"], reverse=True)
+
+    return {
+        "raw_scores": all_scores,
+        "seedwise_means": seedwise_means,
+        "feature_frequencies": feature_frequencies,
+        "n_folds": n_folds_total,
+        "summary_table": summary_table,
+    }
+
+
+def print_repeated_cv_summary(
+    repeated_result,
+    target_name="",
+    min_freq=0.80,
+):
+    """Print compact summary from run_repeated_nested_cv output."""
+    table = repeated_result["summary_table"]
+    ff = repeated_result["feature_frequencies"]
+    n_folds = repeated_result["n_folds"]
+
+    if target_name:
+        print(f"Target: {target_name}")
+    for row in table:
+        name = row["model"]
+        print(f"{name:<22} n={row['n']}  AUC={row['mean']:.3f}±{row['std']:.3f}  "
+              f"med={row['median']:.3f}  min={row['min']:.3f}  max={row['max']:.3f}")
+    print()
+
+    for row in table:
+        name = row["model"]
+        if name not in ff:
+            continue
+        buckets = [
+            ("selected", "selected"),
+            ("corr_dropped", "corr_drop"),
+            ("selector_dropped", "selector_drop"),
+        ]
+        for key, label in buckets:
+            counts = ff[name].get(key, {})
+            if not counts:
+                continue
+            items = sorted(counts.items(), key=lambda x: -x[1])
+            above = [(f, c) for f, c in items if c >= min_freq * n_folds]
+            if not above:
+                continue
+            parts = [f"{f}({c}/{n_folds})" for f, c in above]
+            print(f"{name:<22} {label}>={min_freq:.2f}: {', '.join(parts)}")
+
+
+def report_feature_selection(results, model_name=None):
+    """Print which features were dropped/selected per fold.
+
+    Call after run_nested_cv(..., return_feature_selection=True).
+
+    Parameters
+    ----------
+    results : dict   from run_nested_cv
+    model_name : str, optional   report only this model; if None, report all
+    """
+    models = [model_name] if model_name else list(results.keys())
+    for name in models:
+        if name not in results or "feature_selection" not in results[name]:
+            print(f"  [{name}] No feature selection info (run with return_feature_selection=True)")
+            continue
+        fs_list = results[name]["feature_selection"]
+        print(f"\n  --- {name} ---")
+        for fs in fs_list:
+            n_corr = len(fs["dropped_by_correlation"])
+            n_sel = len(fs["dropped_by_selector"])
+            n_kept = fs["n_selected"]
+            print(f"    Fold {fs['fold']}: {n_kept} selected | "
+                  f"dropped by correlation: {n_corr} | by selector: {n_sel}")
+            if fs["dropped_by_correlation"]:
+                print(f"      Dropped (corr): {fs['dropped_by_correlation']}")
+            if fs["dropped_by_selector"]:
+                print(f"      Dropped (selector): {fs['dropped_by_selector']}")
+            print(f"      Selected: {fs['selected']}")
 
 
 # ------------------------------------------------------------------ #
