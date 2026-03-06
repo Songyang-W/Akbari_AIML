@@ -421,6 +421,105 @@ for target_name, y_target in [("4hr NDS", y_4hr), ("24hr NDS", y_24hr)]:
     plot_comparison(plot_scores, target_name=target_name)
 
 #%% ============================================================
+# BLOCK 4d — NESTED CV WITHOUT FEATURE SELECTION (all features)
+# ============================================================
+print("\n" + "=" * 60)
+print("BLOCK 4d: Nested-CV model comparison (no feature selection)")
+print("=" * 60)
+
+for target_name, y_target in [("4hr NDS", y_4hr), ("24hr NDS", y_24hr)]:
+    n_pos = int(y_target.sum())
+    n_neg = int(len(y_target) - n_pos)
+    print(f"\n  --- Target: {target_name}  (pos={n_pos}, neg={n_neg}) ---")
+
+    if n_pos < 2 or n_neg < 2:
+        print(f"  SKIPPED — need ≥2 samples per class (got {n_pos}/{n_neg})")
+        continue
+
+    repeated_no_fs = run_repeated_nested_cv(
+        X,
+        y_target,
+        seeds=(11, 22, 33, 44, 55),
+        outer_k=5,
+        inner_k=5,
+        corr_threshold=0.85,
+        feature_names=feature_names,
+        verbose=False,
+        feature_selection=False,
+    )
+    print_repeated_cv_summary(repeated_no_fs, target_name=target_name, min_freq=0.80)
+
+    plot_scores_no_fs = {name: {"scores": repeated_no_fs["raw_scores"][name]} for name in repeated_no_fs["raw_scores"]}
+    plot_comparison(plot_scores_no_fs, target_name=f"{target_name} (no FS)")
+
+#%% ============================================================
+# BLOCK 4e — FEATURE IMPORTANCE (Random Forest: MDI + permutation)
+# ============================================================
+print("\n" + "=" * 60)
+print("BLOCK 4e: Feature importance (Random Forest)")
+print("=" * 60)
+
+from sklearn.ensemble import RandomForestClassifier  # noqa: E402
+from sklearn.inspection import permutation_importance  # noqa: E402
+from sklearn.model_selection import train_test_split  # noqa: E402
+
+# Scale features for consistent RF (optional but often done)
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+
+for target_name, y_target in [("4hr NDS", y_4hr), ("24hr NDS", y_24hr)]:
+    if np.unique(y_target).size < 2:
+        continue
+    X_train, X_test, y_train, y_test = train_test_split(
+        X.values, y_target, stratify=y_target, random_state=42, test_size=0.2
+    )
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    forest = RandomForestClassifier(n_estimators=100, random_state=42)
+    forest.fit(X_train_s, y_train)
+
+    # MDI: mean decrease in impurity (with std across trees)
+    importances = forest.feature_importances_
+    std = np.std([tree.feature_importances_ for tree in forest.estimators_], axis=0)
+    order = np.argsort(importances)[::-1]
+    names_ordered = [feature_names[i] for i in order]
+    imp_ordered = importances[order]
+    std_ordered = std[order]
+
+    # Permutation importance on test set
+    perm = permutation_importance(
+        forest, X_test_s, y_test, n_repeats=10, random_state=42, n_jobs=-1
+    )
+    perm_imp = perm.importances_mean[order]
+    perm_std = perm.importances_std[order]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    n_show = min(20, len(feature_names))
+
+    ax = axes[0]
+    ax.barh(range(n_show), imp_ordered[:n_show], xerr=std_ordered[:n_show], align="center")
+    ax.set_yticks(range(n_show))
+    ax.set_yticklabels(names_ordered[:n_show], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean decrease in impurity")
+    ax.set_title(f"{target_name} — Feature importances (MDI)")
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.barh(range(n_show), perm_imp[:n_show], xerr=perm_std[:n_show], align="center", color="C1")
+    ax.set_yticks(range(n_show))
+    ax.set_yticklabels(names_ordered[:n_show], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean accuracy decrease")
+    ax.set_title(f"{target_name} — Permutation importance")
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Random Forest feature importance — {target_name}", fontweight="bold", y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+#%% ============================================================
 # BLOCK 5 — CORRELATION: 4hr NDS vs MAP at MinSBP and SBP5minpostROSC
 # ==============================================================
 print("\n" + "=" * 60)

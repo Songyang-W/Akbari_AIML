@@ -146,6 +146,55 @@ def _build_model_configs(corr_threshold, random_state):
     return configs
 
 
+def _build_model_configs_no_fs(random_state):
+    """Pipelines with no feature selection: StandardScaler + classifier only."""
+    rs = random_state
+    configs = {}
+
+    configs["ElasticNet_Logistic"] = {
+        "pipe": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                penalty="elasticnet", solver="saga", max_iter=5000, random_state=rs,
+            )),
+        ]),
+        "grid": {
+            "clf__C":        [0.01, 0.1, 1.0, 10.0],
+            "clf__l1_ratio": [0.1, 0.5, 0.9],
+        },
+    }
+
+    configs["Random_Forest"] = {
+        "pipe": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", RandomForestClassifier(random_state=rs)),
+        ]),
+        "grid": {
+            "clf__n_estimators":    [100, 200],
+            "clf__max_depth":       [3, 5, None],
+            "clf__min_samples_leaf": [1, 5],
+        },
+    }
+
+    try:
+        from xgboost import XGBClassifier
+        configs["XGBoost"] = {
+            "pipe": Pipeline([
+                ("scaler", StandardScaler()),
+                ("clf", XGBClassifier(verbosity=0, random_state=rs)),
+            ]),
+            "grid": {
+                "clf__n_estimators": [100, 200],
+                "clf__max_depth":    [3, 5],
+                "clf__learning_rate": [0.01, 0.1],
+            },
+        }
+    except ImportError:
+        pass
+
+    return configs
+
+
 # ------------------------------------------------------------------ #
 #  Nested cross-validation                                            #
 # ------------------------------------------------------------------ #
@@ -184,27 +233,29 @@ def run_nested_cv(
     feature_names=None,
     return_feature_selection=False,
     verbose=True,
+    feature_selection=True,
 ):
     """Nested stratified CV comparing three classifiers.
 
-    Inner loop  — ``GridSearchCV`` (hyperparam tuning + feature selection).
+    Inner loop  — ``GridSearchCV`` (hyperparam tuning; + feature selection if feature_selection=True).
     Outer loop  — unbiased ROC-AUC on held-out fold.
 
     Parameters
     ----------
     X : array-like or DataFrame  (n_samples, n_features)
     y : array-like  (n_samples,)  binary 0/1
-    corr_threshold : float   |r| cutoff for CorrelationPruner
+    corr_threshold : float   |r| cutoff for CorrelationPruner (ignored if feature_selection=False)
     outer_k, inner_k : int   number of CV folds
     random_state : int
     feature_names : list, optional   names for each column (inferred from X if DataFrame)
-    return_feature_selection : bool   if True, store per-fold dropped/selected features
+    return_feature_selection : bool   if True and feature_selection=True, store per-fold dropped/selected features
     verbose : bool   if True, print per-fold and per-model lines
+    feature_selection : bool   if False, use all features (no pruner, no selector)
 
     Returns
     -------
     results : dict  ``{model_name: {"scores", "mean", "std", "best_params",
-                  "feature_selection": [...]}}``  (feature_selection if requested)
+                  "feature_selection": [...]}}``  (feature_selection if requested and feature_selection=True)
     """
     if hasattr(X, "columns"):
         X_arr = np.asarray(X, dtype=float)
@@ -213,10 +264,12 @@ def run_nested_cv(
         X_arr = np.asarray(X, dtype=float)
         fnames = feature_names
 
-    if return_feature_selection and fnames is None:
+    if feature_selection and return_feature_selection and fnames is None:
         return_feature_selection = False
         if verbose:
             print("  [WARNING] feature_names not provided — skipping feature selection tracking")
+    if not feature_selection:
+        return_feature_selection = False
 
     y_arr = np.asarray(y, dtype=int)
 
@@ -238,14 +291,14 @@ def run_nested_cv(
         n_splits=inner_k, shuffle=True, random_state=random_state,
     )
 
-    configs = _build_model_configs(corr_threshold, random_state)
+    configs = _build_model_configs(corr_threshold, random_state) if feature_selection else _build_model_configs_no_fs(random_state)
     results = {}
 
     for name, cfg in configs.items():
         if verbose:
             print(f"\n  [{name}]  {outer_k}-fold outer × {inner_k}-fold inner")
         fold_scores, fold_params = [], []
-        fold_feat_sel = [] if return_feature_selection else None
+        fold_feat_sel = [] if (return_feature_selection and feature_selection) else None
 
         for fold_i, (tr_idx, te_idx) in enumerate(
             outer_cv.split(X_arr, y_arr)
@@ -274,7 +327,7 @@ def run_nested_cv(
             if verbose:
                 print(f"    Fold {fold_i + 1}: AUC = {auc:.4f}")
 
-            if return_feature_selection:
+            if fold_feat_sel is not None:
                 fs = _extract_feature_selection(grid.best_estimator_, fnames)
                 fs["fold"] = fold_i + 1
                 fold_feat_sel.append(fs)
@@ -302,8 +355,9 @@ def run_repeated_nested_cv(
     corr_threshold=0.85,
     feature_names=None,
     verbose=False,
+    feature_selection=True,
 ):
-    """Repeated nested CV over multiple seeds; aggregate AUCs and feature frequencies.
+    """Repeated nested CV over multiple seeds; aggregate AUCs and (if feature_selection) feature frequencies.
 
     Parameters
     ----------
@@ -311,18 +365,18 @@ def run_repeated_nested_cv(
     y : array-like  binary 0/1
     seeds : sequence of int   random seeds for outer/inner CV
     outer_k, inner_k : int
-    corr_threshold : float
+    corr_threshold : float   ignored if feature_selection=False
     feature_names : list, optional   inferred from X if DataFrame
     verbose : bool   if True, print per-fold details from each run_nested_cv
-    min_freq : float   only print features with frequency >= this (default 0.80)
+    feature_selection : bool   if False, no correlation/selector steps; feature_frequencies will be empty
 
     Returns
     -------
     dict with keys:
       raw_scores : {model_name: list of all outer-fold AUCs}
       seedwise_means : {model_name: list of mean AUC per seed}
-      feature_frequencies : {model_name: {"selected": {feat: count}, "corr_dropped": {...}, "selector_dropped": {...}}}
-      n_folds : int   total outer folds (len(seeds) * outer_k)
+      feature_frequencies : {model_name: {"selected", "corr_dropped", "selector_dropped"}} or empty
+      n_folds : int   total outer folds
       summary_table : list of dicts [{"model", "n", "mean", "std", "median", "min", "max"}, ...] sorted by mean desc
     """
     if hasattr(X, "columns"):
@@ -343,8 +397,9 @@ def run_repeated_nested_cv(
             inner_k=inner_k,
             random_state=seed,
             feature_names=fnames,
-            return_feature_selection=True,
+            return_feature_selection=feature_selection,
             verbose=verbose,
+            feature_selection=feature_selection,
         )
         for name, r in res.items():
             all_scores.setdefault(name, []).extend(r["scores"])
